@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation
  * Copyright (c) 2012, 2023 Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2018 Payara Foundation and/or its affiliates.
  *
@@ -39,6 +40,9 @@ import org.glassfish.jersey.client.innate.inject.NonInjectionManager;
 import org.glassfish.jersey.client.internal.inject.ParameterUpdaterConfigurator;
 import org.glassfish.jersey.client.spi.Connector;
 import org.glassfish.jersey.client.spi.ConnectorProvider;
+import org.glassfish.jersey.internal.inject.Bindings;
+import org.glassfish.jersey.innate.inject.InjectionIds;
+import org.glassfish.jersey.internal.inject.ProviderBinder;
 import org.glassfish.jersey.internal.AutoDiscoverableConfigurator;
 import org.glassfish.jersey.internal.BootstrapBag;
 import org.glassfish.jersey.internal.BootstrapConfigurator;
@@ -47,10 +51,8 @@ import org.glassfish.jersey.internal.ExceptionMapperFactory;
 import org.glassfish.jersey.internal.FeatureConfigurator;
 import org.glassfish.jersey.internal.JaxrsProviders;
 import org.glassfish.jersey.internal.ServiceFinder;
-import org.glassfish.jersey.internal.inject.Bindings;
 import org.glassfish.jersey.internal.inject.InjectionManager;
 import org.glassfish.jersey.internal.inject.Injections;
-import org.glassfish.jersey.internal.inject.ProviderBinder;
 import org.glassfish.jersey.internal.spi.AutoDiscoverable;
 import org.glassfish.jersey.internal.util.collection.LazyValue;
 import org.glassfish.jersey.internal.util.collection.Value;
@@ -417,69 +419,36 @@ public class ClientConfig implements Configurable<ClientConfig>, ExtendedConfig 
             runtimeCfgState.markAsShared();
 
             final InjectionManager injectionManager = findInjectionManager();
-            injectionManager.register(new ClientBinder(runtimeCfgState.getProperties()));
-
-            final ClientBootstrapBag bootstrapBag = new ClientBootstrapBag();
-            bootstrapBag.setManagedObjectsFinalizer(new ManagedObjectsFinalizer(injectionManager));
-
-            final ClientMessageBodyFactory.MessageBodyWorkersConfigurator messageBodyWorkersConfigurator =
-                    new ClientMessageBodyFactory.MessageBodyWorkersConfigurator();
-
-            List<BootstrapConfigurator> bootstrapConfigurators = Arrays.asList(
-                    new RequestScope.RequestScopeConfigurator(),
-                    new ParamConverterConfigurator(),
-                    new ParameterUpdaterConfigurator(),
-                    new RuntimeConfigConfigurator(runtimeCfgState),
-                    new ContextResolverFactory.ContextResolversConfigurator(),
-                    messageBodyWorkersConfigurator,
-                    new ExceptionMapperFactory.ExceptionMappersConfigurator(),
-                    new JaxrsProviders.ProvidersConfigurator(),
-                    new AutoDiscoverableConfigurator(RuntimeType.CLIENT),
-                    new ClientComponentConfigurator(),
-                    new FeatureConfigurator(RuntimeType.CLIENT));
-            bootstrapConfigurators.forEach(configurator -> configurator.init(injectionManager, bootstrapBag));
-
-            // AutoDiscoverable.
-            if (!CommonProperties.getValue(runtimeCfgState.getProperties(), RuntimeType.CLIENT,
-                    CommonProperties.FEATURE_AUTO_DISCOVERY_DISABLE, Boolean.FALSE, Boolean.class)) {
-                runtimeCfgState.configureAutoDiscoverableProviders(injectionManager, bootstrapBag.getAutoDiscoverables());
-            } else {
-                runtimeCfgState.configureForcedAutoDiscoverableProviders(injectionManager);
-            }
-
-            // Configure binders and features.
-            runtimeCfgState.configureMetaProviders(injectionManager, bootstrapBag.getManagedObjectsFinalizer());
-
-            // Bind providers.
-            final Collection<ComponentProvider> componentProviders = bootstrapBag.getComponentProviders().get();
-            ProviderBinder.bindProviders(
-                    runtimeCfgState.getComponentBag(), RuntimeType.CLIENT, null, injectionManager, componentProviders
-            );
-
-            ClientExecutorProvidersConfigurator executorProvidersConfigurator =
-                    new ClientExecutorProvidersConfigurator(runtimeCfgState.getComponentBag(),
-                            runtimeCfgState.client,
-                            this.executorService,
-                            this.scheduledExecutorService);
-            executorProvidersConfigurator.init(injectionManager, bootstrapBag);
+            final PreInitialization preInit =
+                    new PreInitialization(runtimeCfgState, injectionManager, this.executorService, this.scheduledExecutorService);
+            List<BootstrapConfigurator> bootstrapConfigurators = preInit.bootstrapConfigurators;
 
             injectionManager.completeRegistration();
 
-            bootstrapConfigurators.forEach(configurator -> configurator.postInit(injectionManager, bootstrapBag));
+            bootstrapConfigurators.forEach(configurator -> {
+                if (!configurator.equals(preInit.clientComponentConfigurator)) {
+                    configurator.postInit(injectionManager, preInit.bootstrapBag);
+                }
+            });
+
 
             final ClientConfig configuration = new ClientConfig(runtimeCfgState);
             final Connector connector = connectorProvider.getConnector(client, configuration);
-            final ClientRuntime crt = new ClientRuntime(configuration, connector, injectionManager, bootstrapBag);
+            final ClientRuntime crt = new ClientRuntime(configuration, connector, injectionManager, preInit.bootstrapBag);
+
+            // We call postInit here to clean up thread locals,
+            // while other configurators need to be postInit earlier because they set up dependencies for ClientRuntime
+            preInit.clientComponentConfigurator.postInit(injectionManager, preInit.bootstrapBag);
 
             client.registerShutdownHook(crt);
-            messageBodyWorkersConfigurator.setClientRuntime(crt);
+            preInit.messageBodyWorkersConfigurator.setClientRuntime(crt);
 
             return crt;
         }
 
-        private final InjectionManager findInjectionManager() {
+        private InjectionManager findInjectionManager() {
             try {
-                return Injections.createInjectionManager(RuntimeType.CLIENT);
+                return Injections.createInjectionManager(commonConfig);
             } catch (IllegalStateException ise) {
                 return new NonInjectionManager(true);
             }
@@ -512,6 +481,69 @@ public class ClientConfig implements Configurable<ClientConfig>, ExtendedConfig 
             result = 31 * result + (client != null ? client.hashCode() : 0);
             result = 31 * result + (connectorProvider != null ? connectorProvider.hashCode() : 0);
             return result;
+        }
+    }
+
+    /* package */ static class PreInitialization {
+        private final ClientBootstrapBag bootstrapBag;
+        private final List<BootstrapConfigurator> bootstrapConfigurators;
+        private final ClientMessageBodyFactory.MessageBodyWorkersConfigurator messageBodyWorkersConfigurator;
+        private final ClientComponentConfigurator clientComponentConfigurator;
+
+        /* package */ PreInitialization(InjectionManager injectionManager) {
+            this(new State(new JerseyClient()), injectionManager, null, null);
+        }
+
+
+        /* package */ PreInitialization(
+                State runtimeCfgState,
+                InjectionManager injectionManager,
+                ExecutorService executorService,
+                ScheduledExecutorService scheduledExecutorService) {
+            injectionManager.register(new ClientBinder(runtimeCfgState.getProperties()));
+
+            bootstrapBag = new ClientBootstrapBag();
+            bootstrapBag.setManagedObjectsFinalizer(new ManagedObjectsFinalizer(injectionManager));
+
+            messageBodyWorkersConfigurator = new ClientMessageBodyFactory.MessageBodyWorkersConfigurator(); // 2020
+            clientComponentConfigurator = new ClientComponentConfigurator();
+
+            bootstrapConfigurators = Arrays.asList(new RequestScope.RequestScopeConfigurator(),
+                    new ParamConverterConfigurator(), // 2010
+                    new ParameterUpdaterConfigurator(), // 2011
+                    new RuntimeConfigConfigurator(runtimeCfgState), // 2012
+                    new ContextResolverFactory.ContextResolversConfigurator(), // 2014
+                    messageBodyWorkersConfigurator,
+                    new ExceptionMapperFactory.ExceptionMappersConfigurator(), // 2015
+                    new JaxrsProviders.ProvidersConfigurator(), // 2016
+                    new AutoDiscoverableConfigurator(RuntimeType.CLIENT),
+                    clientComponentConfigurator,
+                    new FeatureConfigurator(RuntimeType.CLIENT));
+            bootstrapConfigurators.forEach(configurator -> configurator.init(injectionManager, bootstrapBag));
+
+            // AutoDiscoverable.
+            if (!CommonProperties.getValue(runtimeCfgState.getProperties(), RuntimeType.CLIENT,
+                    CommonProperties.FEATURE_AUTO_DISCOVERY_DISABLE, Boolean.FALSE, Boolean.class)) {
+                runtimeCfgState.configureAutoDiscoverableProviders(injectionManager, bootstrapBag.getAutoDiscoverables());
+            } else {
+                runtimeCfgState.configureForcedAutoDiscoverableProviders(injectionManager);
+            }
+
+            // Configure binders and features.
+            runtimeCfgState.configureMetaProviders(injectionManager, bootstrapBag.getManagedObjectsFinalizer());
+
+            // Bind providers.
+            final Collection<ComponentProvider> componentProviders = bootstrapBag.getComponentProviders().get();
+            ProviderBinder.bindProviders(
+                    runtimeCfgState.getComponentBag(), RuntimeType.CLIENT, null, injectionManager, componentProviders
+            );
+
+            ClientExecutorProvidersConfigurator executorProvidersConfigurator =
+                    new ClientExecutorProvidersConfigurator(runtimeCfgState.getComponentBag(),
+                            runtimeCfgState.client,
+                            executorService,
+                            scheduledExecutorService);
+            executorProvidersConfigurator.init(injectionManager, bootstrapBag);
         }
     }
 
